@@ -1,0 +1,192 @@
+---
+title: 'Peer Graded Assignment: Prediction Assignment Writeup'
+author: "Dishant Khati"
+date: "June 9, 2022"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Prediction Assignment Writeup
+
+Setting seed, loading libraries and dataset
+
+```{r, include=T, echo=T,results=F, message=F}
+set.seed(123)
+require(data.table);require(ggplot2);require(caret);require(randomForest)
+pmltrain <- read.csv("C:/Users/bajaj/Desktop/pml-training.csv")
+pmltest <- read.csv("C:/Users/bajaj/Desktop/pml-testing.csv")
+```
+
+First I am doing a quick exploration of the data to see if there is something in the data that will affect my modelling decisions.
+
+Checking which column names are common among testing and training, so we can exclude the ones who are not common.
+Checking the class balance in the training set to see whether there is anything in particular we should be concerned with.
+Plotting the classe variable against the first 5 (example exploratory plot).
+
+```{r }
+length(intersect(colnames(pmltrain),colnames(pmltest)))
+barplot(table(pmltrain$classe))
+splom(classe~pmltrain[1:5], data = pmltrain)
+```
+
+159 variables in common, everyone except classe, and the target variable is fairly even blanances across the different classes.
+
+Inspecting if there are some features that only include NAs in the testing set - these should not be used in model training, because they cannot help the prediction in the test set.
+
+```{r}
+test_na <-sapply(pmltest, FUN=function(x){
+  length(which(is.na(x)))
+})
+length(names(test_na[test_na==20]))
+```
+
+There are 100 features that are only NAs, removing these from the training set (and test set).
+Splitting pmltrain into training and test (validation) set and removing NA features.
+Making the split with the same class balace as "classe" - the target variable.
+
+```{r}
+inTrain <- createDataPartition(pmltrain$classe, p = 0.7, list=F)
+training <- pmltrain[inTrain,!names(pmltrain) %in% names(test_na[test_na>0])]
+testing <- pmltrain[-inTrain,!names(pmltrain) %in% names(test_na[test_na>0])]
+```
+
+Controlling the class balance
+
+```{r}
+prop.table(table(training$classe))
+prop.table(table(testing$classe))
+```
+
+Checking if the split generates any all-NA features in either split
+
+```{r}
+table(sapply(training, function(x){
+  all(is.na(x))
+}))
+table(sapply(testing, function(x){
+  all(is.na(x))
+}))
+```
+
+No ALL-NA features in either of the splits.
+Preforming an LDA as part of the exploration as a benchmark and to see if anything is fishy.
+
+```{r, warning=F}
+fitlda <- train(classe~., method="lda", data = training)
+confusionMatrix(fitlda)
+```
+
+The model fits perfectly, which is suspicious.
+Checking variable importance for potential leak of the target variable.
+
+```{r, warning=F}
+lda_varimp <- varImp(fitlda)
+head(lda_varimp$importance, 5)
+```
+
+Variable X seems to perfectly predict variable classe
+
+```{r}
+qplot(X, magnet_forearm_z, colour=classe, data = training)
+```
+
+This is confirmed by the plot, variable X is ordered/sorted by the target variable.
+I don't expect the testing set to have this property.
+
+Dropping the X variable (feature) in testing and training.
+Saving test case for pmltest in another variable for using in reporting predictions.
+
+```{r}
+cases <- pmltest$X
+pmltrain$X <- NULL
+pmltest$X <- NULL
+training$X <- NULL
+testing$X <- NULL
+```
+
+# Fitting models
+
+Doing 10-fold cross validation, 1 time (1 repetition).
+Reevaluating this setting after evaluation of cross validation accuracy and variability.
+
+```{r}
+fitControl <- trainControl(method="cv", number=10, repeats=1)
+```
+
+Fitting three models and comparing: Decision tree, linear discriminant analysis and gradient boosting.
+
+```{r, warning=F, message=F}
+fitTree <- train(classe~., method="rpart", data = training, trControl=fitControl)
+fitlda <- train(classe~., method="lda", data = training, trControl=fitControl)
+fitgbm <- train(classe~., method="gbm", data = training, verbose=F, trControl=fitControl)
+```
+
+Inspecting cross validation accuracy (mean) and variability (standard deviation)
+
+```{r}
+print("Decision tree mean and standard deviation:",mean(fitTree$resample$Accuracy))
+mean(fitTree$resample$Accuracy)
+sd(fitTree$resample$Accuracy)
+print("LDA mean and standard deviation:")
+mean(fitlda$resample$Accuracy)
+sd(fitlda$resample$Accuracy)
+print("GBM mean and standard deviation:")
+mean(fitgbm$resample$Accuracy)
+sd(fitgbm$resample$Accuracy)
+```
+
+Summary of the results - the GBM model has the highest mean accuracy and lowest standard deviation, - the lda model also has a decent accuracy and a bit higher standard deviation than gbm - decision tree model preforms the worst and has the highest standard deviation.
+
+Checking prediction accuracy on my own testing/validation set.
+I am expecting similar accuracy as the mean from the cross validation.
+
+Alternatively the expected out of sample error (cv error) is 1 minus the accuracy.
+Expected out of sample errors for the respective models:
+
+```{r}
+1-mean(fitTree$resample$Accuracy)
+1-mean(fitlda$resample$Accuracy)
+1-mean(fitgbm$resample$Accuracy)
+```
+
+```{r, warning=F, message=F}
+predTree <- predict(fitTree,testing)
+predlda <- predict(fitlda, testing)
+predgbm <- predict(fitgbm, testing)
+
+confusionMatrix(predTree, testing$classe)$table
+confusionMatrix(predTree, testing$classe)$overall[1] # test set accuracy
+
+confusionMatrix(predlda, testing$classe)$table
+confusionMatrix(predlda, testing$classe)$overall[1] # test set accuracy
+
+confusionMatrix(predgbm, testing$classe)$table
+confusionMatrix(predgbm, testing$classe)$overall[1] # test set accuracy
+```
+
+All three models preforms as expected, the deviation from the cross validation accuracy is low and I do not see a reason to change resampling method or adding repetitons.
+LDA seems superior to rpart tree model, but gbm is best in terms of accuracy.
+Choosing to predict on pmltest with the gbm model.
+Checking if there is anything to gain from increasing the number of boosting iterations.
+
+```{r}
+plot(fitgbm)
+print(fitgbm$bestTune)
+```
+
+Accuracy has plateaued, and further tuning would only yield decimal gain.
+- The best tuning parameters was 150 trees (boosting iterations), - interaction depth 3 - shrinkage 0.1.
+
+Deciding to predict with this model.
+
+```{r}
+preds <- predict(fitgbm, pmltest)
+data.frame(cases, preds)
+cat("Predictions: ", paste(predict(fitgbm, pmltest)))
+```
